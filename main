@@ -1,0 +1,280 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>  // usleep
+
+#define TAM_PAGINA 4096          // 4 KB
+#define MEMORIA_FISICA 16384     // 16 KB
+#define NUM_FRAMES (MEMORIA_FISICA / TAM_PAGINA)
+#define MAX_PROCESSOS 10
+#define MAX_PAGINAS 100
+
+typedef enum { FIFO = 1, LRU = 2 } Algoritmo;
+
+typedef struct {
+    int pid;
+    int page;
+    int address;
+    int valid;
+} Frame;
+
+typedef struct {
+    int frames[NUM_FRAMES];    // Para FIFO: ordem dos frames usados
+    int count;                 // Quantidade de frames na fila FIFO
+} FIFOQueue;
+
+typedef struct {
+    int last_used[NUM_FRAMES]; // Para LRU: contador de uso para cada frame
+} LRUTracker;
+
+// Tabela de páginas: para cada processo, armazena o índice do frame onde está a página ou -1
+typedef struct {
+    int pid;
+    int page_table[MAX_PAGINAS]; // índice do frame ou -1 se não mapeado
+} Processo;
+
+void imprimir_memoria_grafica(Frame frames[], int num_frames) {
+    for (int i = 0; i < num_frames; i++) {
+        printf("--------\n");
+        if (frames[i].valid) {
+            printf("| P%d-%d |\n", frames[i].pid, frames[i].page);
+        } else {
+            printf("| ---- |\n");
+        }
+    }
+    printf("--------\n");
+}
+
+int is_page_in_memory(Processo processos[], int num_processos, Frame frames[], int pid, int page, int *out_frame) {
+    for (int i = 0; i < num_processos; i++) {
+        if (processos[i].pid == pid) {
+            int frame_index = processos[i].page_table[page];
+            if (frame_index != -1 && frames[frame_index].valid) {
+                *out_frame = frame_index;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+int find_empty_frame(Frame frames[], int num_frames) {
+    for (int i = 0; i < num_frames; i++) {
+        if (!frames[i].valid) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void shift_fifo(int fifo_order[], int *fifo_count) {
+    for (int i = 1; i < *fifo_count; i++) {
+        fifo_order[i - 1] = fifo_order[i];
+    }
+    (*fifo_count)--;
+}
+
+int find_process_index(Processo processos[], int num_processos, int pid) {
+    for (int i = 0; i < num_processos; i++) {
+        if (processos[i].pid == pid) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int select_frame_lru(LRUTracker *lru_tracker, Frame frames[], int num_frames) {
+    int min_usage = __INT_MAX__;
+    int victim = -1;
+    for (int i = 0; i < num_frames; i++) {
+        if (frames[i].valid && lru_tracker->last_used[i] < min_usage) {
+            min_usage = lru_tracker->last_used[i];
+            victim = i;
+        }
+    }
+    return victim;
+}
+
+int main() {
+    printf("===== SIMULADOR DE PAGINAÇÃO =====\n");
+    printf("Tamanho da página: %d bytes (4 KB)\n", TAM_PAGINA);
+    printf("Tamanho da memória física: %d bytes (16 KB)\n", MEMORIA_FISICA);
+    printf("Número de frames: %d\n", NUM_FRAMES);
+
+    int escolha;
+    printf("Escolha o algoritmo de substituição:\n1 - FIFO\n2 - LRU\n-> ");
+    scanf("%d", &escolha);
+    if (escolha != FIFO && escolha != LRU) {
+        printf("Algoritmo inválido. Saindo.\n");
+        return 1;
+    }
+    Algoritmo algoritmo = (Algoritmo)escolha;
+    printf("Algoritmo escolhido: %s\n", (algoritmo == FIFO) ? "FIFO" : "LRU");
+
+    FILE *file = fopen("arquivoso.csv", "r");
+    if (!file) {
+        printf("Arquivo 'arquivoso.csv' não encontrado.\n");
+        return 1;
+    }
+
+    Frame physical_memory[NUM_FRAMES] = {0};
+    for (int i = 0; i < NUM_FRAMES; i++) physical_memory[i].valid = 0;
+
+    FIFOQueue fifo_queue = {{0}, 0};
+    LRUTracker lru_tracker = {{0}};
+
+    Processo processos[MAX_PROCESSOS];
+    int num_processos = 0;
+
+    // Inicializa tabelas de páginas
+    for (int i = 0; i < MAX_PROCESSOS; i++) {
+        processos[i].pid = -1;
+        for (int j = 0; j < MAX_PAGINAS; j++) {
+            processos[i].page_table[j] = -1;
+        }
+    }
+
+    int fault_count = 0;
+    int access_count = 0;
+    int hit_count = 0;
+
+    char line[100];
+    int time_step = 0;
+
+    while (fgets(line, sizeof(line), file)) {
+        int pid, page, addr;
+        if (sscanf(line, "%d,%d,%d", &pid, &page, &addr) != 3) {
+            printf("Linha inválida: %s", line);
+            continue;
+        }
+        access_count++;
+
+        // Verifica se processo já existe, senão adiciona
+        int proc_idx = find_process_index(processos, num_processos, pid);
+        if (proc_idx == -1) {
+            if (num_processos < MAX_PROCESSOS) {
+                processos[num_processos].pid = pid;
+                // Página inicializada como -1
+                proc_idx = num_processos;
+                num_processos++;
+            } else {
+                printf("Limite de processos excedido.\n");
+                break;
+            }
+        }
+
+        int frame_index;
+        if (is_page_in_memory(processos, num_processos, physical_memory, pid, page, &frame_index)) {
+            // Página já está na memória física - HIT
+            hit_count++;
+            printf("Tempo t=%d: Página %d do Processo %d já está na memória física.\n", time_step, page, pid);
+
+            if (algoritmo == LRU) {
+                // Atualiza uso do LRU para o frame acessado
+                lru_tracker.last_used[frame_index] = time_step;
+            }
+        } else {
+            // PAGE FAULT
+            fault_count++;
+            printf("Tempo t=%d: [PAGE FAULT] Página %d do Processo %d não está na memória física!\n", time_step, page, pid);
+
+            int empty_frame = find_empty_frame(physical_memory, NUM_FRAMES);
+
+            if (empty_frame != -1) {
+                // Frame livre disponível
+                physical_memory[empty_frame].pid = pid;
+                physical_memory[empty_frame].page = page;
+                physical_memory[empty_frame].address = addr;
+                physical_memory[empty_frame].valid = 1;
+
+                // Atualiza tabela de páginas do processo
+                processos[proc_idx].page_table[page] = empty_frame;
+
+                if (algoritmo == FIFO) {
+                    fifo_queue.frames[fifo_queue.count++] = empty_frame;
+                } else if (algoritmo == LRU) {
+                    lru_tracker.last_used[empty_frame] = time_step;
+                }
+
+                printf("Tempo t=%d: Carregando Página %d do Processo %d no Frame %d\n", time_step, page, pid, empty_frame);
+                frame_index = empty_frame;
+            } else {
+                // Substituição necessária
+                int evict_frame = -1;
+                if (algoritmo == FIFO) {
+                    evict_frame = fifo_queue.frames[0];
+                    // Remove do FIFO
+                    shift_fifo(fifo_queue.frames, &fifo_queue.count);
+                } else if (algoritmo == LRU) {
+                    evict_frame = select_frame_lru(&lru_tracker, physical_memory, NUM_FRAMES);
+                }
+
+                if (evict_frame == -1) {
+                    printf("Erro: não foi possível selecionar frame para substituição.\n");
+                    break;
+                }
+
+                // Página e processo da página a ser removida
+                int evict_pid = physical_memory[evict_frame].pid;
+                int evict_page = physical_memory[evict_frame].page;
+
+                // Remove da tabela do processo que perdeu a página
+                int evict_proc_idx = find_process_index(processos, num_processos, evict_pid);
+                if (evict_proc_idx != -1) {
+                    processos[evict_proc_idx].page_table[evict_page] = -1;
+                }
+
+                printf("Tempo t=%d: Substituindo Página %d do Processo %d no Frame %d pela Página %d do Processo %d (%s)\n",
+                       time_step,
+                       evict_page,
+                       evict_pid,
+                       evict_frame,
+                       page,
+                       pid,
+                       (algoritmo == FIFO) ? "FIFO" : "LRU");
+
+                // Substitui a página no frame
+                physical_memory[evict_frame].pid = pid;
+                physical_memory[evict_frame].page = page;
+                physical_memory[evict_frame].address = addr;
+                physical_memory[evict_frame].valid = 1;
+
+                // Atualiza tabela do processo novo
+                processos[proc_idx].page_table[page] = evict_frame;
+
+                if (algoritmo == FIFO) {
+                    // Coloca no fim da fila FIFO
+                    fifo_queue.frames[fifo_queue.count++] = evict_frame;
+                } else if (algoritmo == LRU) {
+                    lru_tracker.last_used[evict_frame] = time_step;
+                }
+
+                frame_index = evict_frame;
+            }
+        }
+
+        int deslocamento = addr % TAM_PAGINA;
+        int endereco_fisico = frame_index * TAM_PAGINA + deslocamento;
+
+        printf("Tempo t=%d\nEstado da Memória Física:\n", time_step);
+        imprimir_memoria_grafica(physical_memory, NUM_FRAMES);
+        printf("Tempo t=%d: Endereço Virtual (P%d): %d -> Página: %d -> Frame: %d -> Endereço Físico: %d\n\n",
+               time_step, pid, addr, page, frame_index, endereco_fisico);
+
+        time_step++;
+        usleep(300000); // 0.3s para simular tempo
+    }
+
+    printf("======== ESTATÍSTICAS DA SIMULAÇÃO ========\n");
+    printf("Total de acessos à memória: %d\n", access_count);
+    printf("Total de page faults: %d\n", fault_count);
+    printf("Total de hits: %d\n", hit_count);
+    double taxa_fault = (access_count > 0) ? (fault_count * 100.0 / access_count) : 0.0;
+    double taxa_hit = (access_count > 0) ? (hit_count * 100.0 / access_count) : 0.0;
+    printf("Taxa de page faults: %.2f%%\n", taxa_fault);
+    printf("Taxa de hits: %.2f%%\n", taxa_hit);
+    printf("Algoritmo utilizado: %s\n", (algoritmo == FIFO) ? "FIFO" : "LRU");
+
+    fclose(file);
+    return 0;
+}
